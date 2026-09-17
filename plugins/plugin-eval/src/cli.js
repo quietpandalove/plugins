@@ -18,7 +18,7 @@ Core workflows:
   plugin-eval explain-budget <path> [--format json|markdown] [--output <file>]
   plugin-eval measurement-plan <path> [--format json|markdown] [--observed-usage <file>] [--output <file>]
   plugin-eval init-benchmark <path> [--output <benchmark.json>] [--model <model>] [--format json|markdown]
-  plugin-eval benchmark <path> [--config <benchmark.json>] [--usage-out <usage.jsonl>] [--result-out <result.json>] [--model <model>] [--format json|markdown|html] [--output <file>]
+  plugin-eval benchmark <path> --config <benchmark.json> --workspace-source <directory> [--workspace-include <file>] [--target-include <file>] [--usage-out <usage.jsonl>] [--result-out <result.json>] [--model <model>] [--format json|markdown|html] [--output <file>]
 
 Reports:
   plugin-eval report <result.json> [--format json|markdown|html] [--output <file>]
@@ -50,6 +50,10 @@ function parseOptions(argv) {
     goal: null,
     request: null,
     dryRun: false,
+    allowVerifiers: false,
+    workspaceSourcePath: null,
+    workspaceIncludes: [],
+    targetIncludes: [],
     briefOut: null,
   };
 
@@ -70,6 +74,15 @@ function parseOptions(argv) {
     } else if (arg === "--config") {
       options.configPath = argv[index + 1];
       index += 1;
+    } else if (arg === "--workspace-source") {
+      options.workspaceSourcePath = argv[index + 1];
+      index += 1;
+    } else if (arg === "--workspace-include") {
+      options.workspaceIncludes.push(argv[index + 1]);
+      index += 1;
+    } else if (arg === "--target-include") {
+      options.targetIncludes.push(argv[index + 1]);
+      index += 1;
     } else if (arg === "--usage-out") {
       options.usageOutPath = argv[index + 1];
       index += 1;
@@ -87,6 +100,8 @@ function parseOptions(argv) {
       index += 1;
     } else if (arg === "--dry-run") {
       options.dryRun = true;
+    } else if (arg === "--allow-verifiers") {
+      options.allowVerifiers = true;
     } else if (arg === "--brief-out") {
       options.briefOut = argv[index + 1];
       index += 1;
@@ -210,6 +225,10 @@ export async function runCli(argv) {
       resultOutPath: options.resultOutPath,
       model: options.model,
       dryRun: options.dryRun,
+      allowVerifiers: options.allowVerifiers,
+      workspaceSourcePath: options.workspaceSourcePath,
+      workspaceIncludes: options.workspaceIncludes,
+      targetIncludes: options.targetIncludes,
     });
     await emit(payload, options.format, options.output);
     return;

@@ -113,7 +113,7 @@ function renderChecks(checks) {
         parts.push(`Why: ${check.why}`);
       }
       if (check.evidence?.length > 0) {
-        parts.push(`Evidence: ${check.evidence.join(" ")}`);
+        parts.push(`Evidence: ${check.evidence.map((value) => String(value).replace(/\r?\n/g, "\\n").replace(/[\\`*_{}\[\]()#+.!>|-]/g, "\\$&")).join(" ")}`);
       }
       if (check.remediation?.length > 0) {
         parts.push(`Remediation: ${check.remediation.join(" ")}`);
@@ -518,6 +518,11 @@ function renderBenchmarkScenario(scenario, mode) {
     lines.push(`- Generated tests: ${scenario.workspaceSummary.generatedTestFileCount}`);
   }
 
+  if (scenario.diagnosticsPath) {
+    lines.push(`- Diagnostics: \`${scenario.diagnosticsPath}\``);
+    lines.push("- Raw child output: not retained");
+  }
+
   if (scenario.finalMessagePreview) {
     lines.push("", "```text", scenario.finalMessagePreview, "```");
   }
@@ -527,7 +532,7 @@ function renderBenchmarkScenario(scenario, mode) {
   }
 
   if (scenario.verifierResults?.length > 0) {
-    lines.push("", ...scenario.verifierResults.map((result) => `- Verifier [${result.status}]: ${result.command}`));
+    lines.push("", ...scenario.verifierResults.map((result) => `- Created-file check [${result.status}]: ${result.path}`));
   }
 
   if (scenario.generatedCode?.metrics?.length > 0) {

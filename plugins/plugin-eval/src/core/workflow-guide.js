@@ -1,12 +1,8 @@
 import path from "node:path";
 
-import { formatCommandPath, pathExists, relativePath } from "../lib/files.js";
+import { formatCommandPath, formatGeneratedCommand, pathExists, quoteCommandArgument, relativePath } from "../lib/files.js";
 import { createWorkflowGuideNextAction } from "./presentation.js";
 import { resolveTarget } from "./target.js";
-
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\''")}'`;
-}
 
 function benchmarkConfigPath(target) {
   return path.join(target.path, ".plugin-eval", "benchmark.json");
@@ -184,6 +180,7 @@ function workflowLabel(goal, target) {
 function commandsForGoal(goal, target, status) {
   const commandTargetPath = formatCommandPath(target.path);
   const commandConfigPath = formatCommandPath(benchmarkConfigPath(target));
+  const benchmarkCommand = `plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath} --workspace-source YOUR_TEST_WORKSPACE`;
   const commandUsagePath = formatCommandPath(usageLogPath(target));
 
   if (goal === "analysis") {
@@ -191,14 +188,14 @@ function commandsForGoal(goal, target, status) {
       return [
         `plugin-eval analyze ${commandTargetPath} --format markdown`,
         `plugin-eval init-benchmark ${commandTargetPath}`,
-        `plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath}`,
+        benchmarkCommand,
       ];
     }
 
     if (!status.hasUsageLog) {
       return [
         `plugin-eval analyze ${commandTargetPath} --format markdown`,
-        `plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath}`,
+        benchmarkCommand,
       ];
     }
 
@@ -220,14 +217,14 @@ function commandsForGoal(goal, target, status) {
     if (!status.hasBenchmarkConfig) {
       return [
         `plugin-eval init-benchmark ${commandTargetPath}`,
-        `plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath}`,
+        benchmarkCommand,
         `plugin-eval analyze ${commandTargetPath} --observed-usage ${commandUsagePath} --format markdown`,
       ];
     }
 
     if (!status.hasUsageLog) {
       return [
-        `plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath}`,
+        benchmarkCommand,
         `plugin-eval analyze ${commandTargetPath} --observed-usage ${commandUsagePath} --format markdown`,
       ];
     }
@@ -246,7 +243,7 @@ function commandsForGoal(goal, target, status) {
     }
 
     return [
-      `plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath}`,
+      benchmarkCommand,
     ];
   }
 
@@ -259,7 +256,7 @@ function commandsForGoal(goal, target, status) {
 
   if (status.hasBenchmarkConfig) {
     return [
-      `plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath}`,
+      benchmarkCommand,
     ];
   }
 
@@ -327,7 +324,7 @@ function inferRecommendedGoal(status, explicitGoal) {
 function createEntry(goal, target, status) {
   const commandTargetPath = formatCommandPath(target.path);
   const chatPrompt = chatPromptForGoal(goal, target);
-  const commands = commandsForGoal(goal, target, status);
+  const commands = commandsForGoal(goal, target, status).map(formatGeneratedCommand);
   return {
     id: goal,
     label: workflowLabel(goal, target),
@@ -335,7 +332,7 @@ function createEntry(goal, target, status) {
     summary: summaryForGoal(goal, target, status),
     firstCommand: commands[0],
     commands,
-    startCommand: `plugin-eval start ${commandTargetPath} --request ${shellQuote(chatPrompt)} --format markdown`,
+    startCommand: formatGeneratedCommand(`plugin-eval start ${commandTargetPath} --request ${quoteCommandArgument(chatPrompt)} --format markdown`),
   };
 }
 
@@ -385,7 +382,7 @@ export async function buildWorkflowGuide(targetPath, options = {}) {
       label: recommendedWorkflow.label,
       summary: recommendedWorkflow.summary,
       routingExplanation,
-      startCommand: `plugin-eval start ${commandTargetPath} --request ${shellQuote(routedRequest)} --format markdown`,
+      startCommand: formatGeneratedCommand(`plugin-eval start ${commandTargetPath} --request ${quoteCommandArgument(routedRequest)} --format markdown`),
       firstCommand: recommendedWorkflow.firstCommand,
       commands: recommendedWorkflow.commands,
     },

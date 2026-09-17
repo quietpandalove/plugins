@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 
 import { isDirectory, isFile, pathExists, listImmediateDirectories, readJson } from "../lib/files.js";
@@ -65,9 +66,46 @@ export async function resolveTarget(inputPath) {
   };
 }
 
+function isWithin(rootPath, candidatePath) {
+  const relative = path.relative(rootPath, candidatePath);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+export async function resolvePluginSkillsRoot(pluginRoot, configuredPath = "./skills/") {
+  if (typeof configuredPath !== "string" || !configuredPath || configuredPath.includes("\0") ||
+    configuredPath.includes("\\") || configuredPath.includes(":") ||
+    path.posix.isAbsolute(configuredPath) || path.win32.isAbsolute(configuredPath)) {
+    throw new Error("Plugin skills path must stay within the plugin root.");
+  }
+  const parts = configuredPath.replace(/^\.\//, "").split("/").filter(Boolean);
+  if (parts.length === 0 || parts.some((part) => part === "." || part === "..")) {
+    throw new Error("Plugin skills path must stay within the plugin root.");
+  }
+
+  const rootPath = path.resolve(pluginRoot);
+  const realRoot = await fs.realpath(rootPath);
+  const skillsRoot = path.resolve(rootPath, ...parts);
+  if (!isWithin(rootPath, skillsRoot)) {
+    throw new Error("Plugin skills path must stay within the plugin root.");
+  }
+  let current = rootPath;
+  for (const part of parts) {
+    current = path.join(current, part);
+    try {
+      await fs.lstat(current);
+    } catch (error) {
+      if (error.code === "ENOENT") break;
+      throw error;
+    }
+    if (!isWithin(realRoot, await fs.realpath(current))) {
+      throw new Error("Plugin skills path must stay within the plugin root.");
+    }
+  }
+  return skillsRoot;
+}
+
 export async function discoverPluginSkillDirectories(pluginRoot, manifest) {
-  const configuredPath = manifest?.skills ? manifest.skills.replace(/^\.\//, "") : "skills";
-  const skillsRoot = path.join(pluginRoot, configuredPath);
+  const skillsRoot = await resolvePluginSkillsRoot(pluginRoot, manifest?.skills || "./skills/");
   if (!(await isDirectory(skillsRoot))) {
     return [];
   }

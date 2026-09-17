@@ -1,13 +1,10 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 
 import { isProbablyTextFile, isDirectory, readText, relativePath } from "../lib/files.js";
-
-const execFileAsync = promisify(execFile);
 
 const SNAPSHOT_IGNORED_DIRS = new Set([
   ".git",
@@ -25,19 +22,85 @@ const SNAPSHOT_IGNORED_DIRS = new Set([
   ".plugin-eval",
 ]);
 
+const MAX_SNAPSHOT_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_SNAPSHOT_TOTAL_BYTES = 256 * 1024 * 1024;
+const MAX_SNAPSHOT_FILES = 10000;
+const MAX_SNAPSHOT_ENTRIES = 20000;
+
+export class BenchmarkResourceLimitError extends Error {
+  constructor(resource, limit, observed, unit = "bytes") {
+    super(`Benchmark ${resource} exceeded the ${limit} ${unit} limit.`);
+    this.name = "BenchmarkResourceLimitError";
+    this.resource = resource;
+    this.limit = limit;
+    this.observed = observed;
+    this.unit = unit;
+  }
+}
+
 function testFilePattern(filePath) {
   return /(^|\/)(tests?|__tests__)\/|(\.test|\.spec)\.|(^|\/)test_[^/]+\.py$/.test(filePath);
 }
 
-async function copyDirectory(sourcePath, destinationPath) {
-  await fs.mkdir(path.dirname(destinationPath), { recursive: true });
-  await fs.cp(sourcePath, destinationPath, { recursive: true });
+function fileParts(relativeFile) {
+  if (typeof relativeFile !== "string" || !relativeFile || relativeFile.includes("\0") ||
+    path.posix.isAbsolute(relativeFile) || path.win32.isAbsolute(relativeFile)) {
+    throw new Error("Benchmark includes must be exact relative file paths.");
+  }
+  const parts = relativeFile.split(/[\\/]/);
+  if (parts.some((part) => !part || part === "." || part === ".." || part.includes(":"))) {
+    throw new Error("Benchmark includes must be exact relative file paths.");
+  }
+  return parts;
+}
+
+async function assertNoSymlinkAncestors(sourcePath) {
+  const resolved = path.resolve(sourcePath);
+  let current = path.parse(resolved).root;
+  for (const part of path.relative(current, resolved).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    if ((await fs.lstat(current)).isSymbolicLink()) {
+      throw new Error("Benchmark source paths must not contain symbolic links.");
+    }
+  }
+}
+
+export function normalizeBenchmarkFilePath(relativeFile) {
+  return fileParts(relativeFile).join("/");
+}
+
+async function copySelectedFiles(sourcePath, destinationPath, includes) {
+  if (!Array.isArray(includes)) throw new Error("Benchmark includes must be a file list.");
+  await assertNoSymlinkAncestors(sourcePath);
+  await fs.mkdir(destinationPath, { recursive: true });
+  const realRoot = await fs.realpath(sourcePath);
+  for (const relativeFile of new Set(includes)) {
+    const parts = fileParts(relativeFile);
+    let current = sourcePath;
+    for (const [index, part] of parts.entries()) {
+      current = path.join(current, part);
+      const stat = await fs.lstat(current);
+      if (stat.isSymbolicLink() || (index === parts.length - 1 ? !stat.isFile() : !stat.isDirectory())) {
+        throw new Error("Benchmark includes must name regular files without symbolic links.");
+      }
+    }
+    const realFile = await fs.realpath(current);
+    const relativeRealFile = path.relative(realRoot, realFile);
+    if (relativeRealFile === ".." || relativeRealFile.startsWith(`..${path.sep}`) || path.isAbsolute(relativeRealFile)) {
+      throw new Error("Benchmark include escapes its source directory.");
+    }
+    const destination = path.join(destinationPath, ...parts);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.copyFile(current, destination);
+  }
 }
 
 async function copyIfExists(sourcePath, destinationPath) {
   try {
-    await fs.access(sourcePath);
-  } catch {
+    const stat = await fs.lstat(sourcePath);
+    if (!stat.isFile()) throw new Error("Scoped Codex home files must be regular files, not symbolic links.");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
     return false;
   }
 
@@ -46,13 +109,8 @@ async function copyIfExists(sourcePath, destinationPath) {
   return true;
 }
 
-async function resolveGitRoot(sourcePath) {
-  const { stdout } = await execFileAsync("git", ["-C", sourcePath, "rev-parse", "--show-toplevel"]);
-  return stdout.trim();
-}
-
-async function createWorkspaceCopy(sourcePath, workspacePath) {
-  await copyDirectory(sourcePath, workspacePath);
+async function createWorkspaceCopy(sourcePath, workspacePath, includes) {
+  await copySelectedFiles(sourcePath, workspacePath, includes);
   return {
     workspacePath,
     cleanup: async () => {
@@ -61,27 +119,16 @@ async function createWorkspaceCopy(sourcePath, workspacePath) {
   };
 }
 
-async function createWorkspaceFromGitWorktree(sourcePath, workspacePath) {
-  const repoRoot = await resolveGitRoot(sourcePath);
-  await execFileAsync("git", ["-C", repoRoot, "worktree", "add", "--detach", workspacePath]);
-  return {
-    workspacePath,
-    cleanup: async () => {
-      await execFileAsync("git", ["-C", repoRoot, "worktree", "remove", "--force", workspacePath]);
-    },
-  };
-}
-
-async function provisionSkillInstall(target, codexHomePath) {
+async function provisionSkillInstall(target, codexHomePath, targetIncludes) {
   const skillPath = path.join(codexHomePath, "skills", target.name);
-  await copyDirectory(target.path, skillPath);
+  await copySelectedFiles(target.path, skillPath, ["SKILL.md", ...targetIncludes]);
   return skillPath;
 }
 
-async function provisionPluginInstall(target, workspacePath) {
+async function provisionPluginInstall(target, workspacePath, targetIncludes) {
   const pluginsRoot = path.join(workspacePath, "plugins");
   const installPath = path.join(pluginsRoot, target.name);
-  await copyDirectory(target.path, installPath);
+  await copySelectedFiles(target.path, installPath, [".codex-plugin/plugin.json", ...targetIncludes]);
 
   const marketplacePath = path.join(workspacePath, ".agents", "plugins", "marketplace.json");
   const marketplace = {
@@ -111,15 +158,21 @@ async function provisionPluginInstall(target, workspacePath) {
 }
 
 async function seedCodexHome(codexHomePath) {
-  const sourceCodexHome = process.env.PLUGIN_EVAL_CODEX_HOME_SOURCE
+  const explicitSourceCodexHome = process.env.PLUGIN_EVAL_CODEX_HOME_SOURCE
     ? path.resolve(process.env.PLUGIN_EVAL_CODEX_HOME_SOURCE)
-    : path.join(os.homedir(), ".codex");
+    : null;
+  if (explicitSourceCodexHome) await assertNoSymlinkAncestors(explicitSourceCodexHome);
 
   await fs.mkdir(codexHomePath, { recursive: true });
-  await Promise.all([
-    copyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHomePath, "auth.json")),
-    copyIfExists(path.join(sourceCodexHome, "config.toml"), path.join(codexHomePath, "config.toml")),
+  const copied = await Promise.all([
+    explicitSourceCodexHome
+      ? copyIfExists(path.join(explicitSourceCodexHome, "auth.json"), path.join(codexHomePath, "auth.json"))
+      : Promise.resolve(false),
+    explicitSourceCodexHome
+      ? copyIfExists(path.join(explicitSourceCodexHome, "config.toml"), path.join(codexHomePath, "config.toml"))
+      : Promise.resolve(false),
   ]);
+  return copied.some(Boolean);
 }
 
 export function defaultTargetProvisioningMode(target) {
@@ -132,58 +185,86 @@ export function defaultTargetProvisioningMode(target) {
   throw new Error("Benchmarking only supports Codex skills and plugins.");
 }
 
-export async function provisionBenchmarkWorkspace({ target, config, scenarioId }) {
+export async function provisionBenchmarkWorkspace({ target, config, scenarioId, workspaceIncludes = [], targetIncludes = [] }) {
   const sourcePath = path.resolve(config.workspace.sourcePath);
   if (!(await isDirectory(sourcePath))) {
     throw new Error(`Benchmark workspace.sourcePath must be a directory: ${sourcePath}`);
+  }
+
+  const setupMode = config.workspace.setupMode || "copy";
+  if (setupMode !== "copy") throw new Error("Benchmark workspace setupMode must be copy; git-worktree is disabled.");
+  if (target.kind === "plugin" && targetIncludes.length === 0) {
+    throw new Error("Plugin benchmarks require explicit --target-include entries for the plugin files to evaluate.");
   }
 
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), `plugin-eval-${scenarioId}-`));
   const workspacePath = path.join(tempRoot, "workspace");
   const homePath = path.join(tempRoot, "home");
   const codexHomePath = path.join(homePath, ".codex");
-  const setupMode = config.workspace.setupMode || "copy";
+  let workspace;
+  try {
+    const sensitiveHomeSeeded = await seedCodexHome(codexHomePath);
+    workspace = await createWorkspaceCopy(sourcePath, workspacePath, workspaceIncludes);
 
-  await seedCodexHome(codexHomePath);
+    let installedTargetPath = null;
+    if (config.targetProvisioning.mode === "isolated-skill-home") {
+      installedTargetPath = await provisionSkillInstall(target, codexHomePath, targetIncludes);
+    } else if (config.targetProvisioning.mode === "workspace-plugin-marketplace") {
+      installedTargetPath = await provisionPluginInstall(target, workspacePath, targetIncludes);
+    } else {
+      throw new Error(`Unsupported target provisioning mode: ${config.targetProvisioning.mode}`);
+    }
 
-  const workspace =
-    setupMode === "git-worktree"
-      ? await createWorkspaceFromGitWorktree(sourcePath, workspacePath)
-      : await createWorkspaceCopy(sourcePath, workspacePath);
-
-  let installedTargetPath = null;
-  if (config.targetProvisioning.mode === "isolated-skill-home") {
-    installedTargetPath = await provisionSkillInstall(target, codexHomePath);
-  } else if (config.targetProvisioning.mode === "workspace-plugin-marketplace") {
-    installedTargetPath = await provisionPluginInstall(target, workspacePath);
-  } else {
-    throw new Error(`Unsupported target provisioning mode: ${config.targetProvisioning.mode}`);
-  }
-
-  return {
+    return {
     tempRoot,
     workspacePath,
     homePath,
     codexHomePath,
     installedTargetPath,
     setupMode,
-    cleanup: async () => {
-      await workspace.cleanup();
+    sensitiveHomeSeeded,
+      cleanupSensitiveHome: async () => fs.rm(homePath, { recursive: true, force: true }),
+      cleanup: async () => {
+        try {
+          await workspace.cleanup();
+        } finally {
+          await fs.rm(tempRoot, { recursive: true, force: true });
+        }
+      },
+    };
+  } catch (error) {
+    try {
+      if (workspace) await workspace.cleanup();
+    } finally {
       await fs.rm(tempRoot, { recursive: true, force: true });
-    },
-  };
+    }
+    throw error;
+  }
 }
 
-async function hashFile(filePath) {
+async function inspectSnapshotFile(filePath, isText) {
   const hash = createHash("sha1");
-  hash.update(await fs.readFile(filePath));
-  return hash.digest("hex");
+  let bytes = 0;
+  let lineCount = 1;
+  for await (const chunk of createReadStream(filePath)) {
+    bytes += chunk.length;
+    if (bytes > MAX_SNAPSHOT_FILE_BYTES) {
+      throw new BenchmarkResourceLimitError("workspace snapshot file", MAX_SNAPSHOT_FILE_BYTES, bytes);
+    }
+    hash.update(chunk);
+    if (isText) {
+      for (const byte of chunk) if (byte === 10) lineCount += 1;
+    }
+  }
+  return { hash: hash.digest("hex"), lineCount: isText ? lineCount : null, bytes };
 }
 
-async function visitSnapshot(rootPath, currentPath, entries) {
-  const directoryEntries = await fs.readdir(currentPath, { withFileTypes: true });
-
-  for (const entry of directoryEntries) {
+async function visitSnapshot(rootPath, currentPath, entries, state) {
+  for await (const entry of await fs.opendir(currentPath)) {
+    state.entryCount += 1;
+    if (state.entryCount > MAX_SNAPSHOT_ENTRIES) {
+      throw new BenchmarkResourceLimitError("workspace snapshot entry count", MAX_SNAPSHOT_ENTRIES, state.entryCount, "entries");
+    }
     const entryPath = path.join(currentPath, entry.name);
     const relativeEntryPath = relativePath(rootPath, entryPath);
 
@@ -191,7 +272,7 @@ async function visitSnapshot(rootPath, currentPath, entries) {
       if (SNAPSHOT_IGNORED_DIRS.has(entry.name)) {
         continue;
       }
-      await visitSnapshot(rootPath, entryPath, entries);
+      await visitSnapshot(rootPath, entryPath, entries, state);
       continue;
     }
 
@@ -199,24 +280,37 @@ async function visitSnapshot(rootPath, currentPath, entries) {
       continue;
     }
 
+    if (entries.size >= MAX_SNAPSHOT_FILES) {
+      throw new BenchmarkResourceLimitError("workspace snapshot file count", MAX_SNAPSHOT_FILES, entries.size + 1, "files");
+    }
     const stats = await fs.stat(entryPath);
+    if (stats.size > MAX_SNAPSHOT_FILE_BYTES) {
+      throw new BenchmarkResourceLimitError("workspace snapshot file", MAX_SNAPSHOT_FILE_BYTES, stats.size);
+    }
+    if (state.totalBytes + stats.size > MAX_SNAPSHOT_TOTAL_BYTES) {
+      throw new BenchmarkResourceLimitError("workspace snapshot total", MAX_SNAPSHOT_TOTAL_BYTES, state.totalBytes + stats.size);
+    }
     const isText = isProbablyTextFile(entryPath);
-    const text = isText ? await readText(entryPath) : null;
+    const inspected = await inspectSnapshotFile(entryPath, isText);
+    state.totalBytes += inspected.bytes;
+    if (state.totalBytes > MAX_SNAPSHOT_TOTAL_BYTES) {
+      throw new BenchmarkResourceLimitError("workspace snapshot total", MAX_SNAPSHOT_TOTAL_BYTES, state.totalBytes);
+    }
 
     entries.set(relativeEntryPath, {
       path: relativeEntryPath,
       absolutePath: entryPath,
       size: stats.size,
-      hash: await hashFile(entryPath),
+      hash: inspected.hash,
       isText,
-      lineCount: text === null ? null : text.replace(/\r\n/g, "\n").split("\n").length,
+      lineCount: inspected.lineCount,
     });
   }
 }
 
 export async function snapshotWorkspace(rootPath) {
   const entries = new Map();
-  await visitSnapshot(rootPath, rootPath, entries);
+  await visitSnapshot(rootPath, rootPath, entries, { totalBytes: 0, entryCount: 0 });
   return entries;
 }
 

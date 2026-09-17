@@ -4,6 +4,7 @@ import path from "node:path";
 import { parseFrontmatter, parseYamlDocument } from "../lib/frontmatter.js";
 import { isDirectory, isProbablyTextFile, pathExists, readJson, readText, relativePath, walkFiles } from "../lib/files.js";
 import { estimateTokenCount, sumTokenCounts } from "../lib/tokens.js";
+import { resolvePluginSkillsRoot } from "./target.js";
 
 function createComponent(label, componentPath, tokens, note) {
   return {
@@ -227,7 +228,7 @@ export async function computePluginBudget(pluginRoot, manifest) {
 }
 
 async function discoverSkillDirs(pluginRoot, skillsPath) {
-  const directory = path.join(pluginRoot, skillsPath.replace(/^\.\//, ""));
+  const directory = await resolvePluginSkillsRoot(pluginRoot, skillsPath);
   if (!(await isDirectory(directory))) {
     return [];
   }

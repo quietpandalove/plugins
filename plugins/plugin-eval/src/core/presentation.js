@@ -1,9 +1,5 @@
-import { formatCommandPath, relativePath } from "../lib/files.js";
+import { formatCommandPath, formatGeneratedCommand, quoteCommandArgument, relativePath } from "../lib/files.js";
 import { enrichSummary } from "./scoring.js";
-
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\''")}'`;
-}
 
 function targetLabel(target) {
   if (target.kind === "plugin") {
@@ -26,7 +22,7 @@ function targetTypeLabel(target) {
 }
 
 function buildStartCommand(target, chatPrompt) {
-  return `plugin-eval start ${formatCommandPath(target.path)} --request ${shellQuote(chatPrompt)} --format markdown`;
+  return formatGeneratedCommand(`plugin-eval start ${formatCommandPath(target.path)} --request ${quoteCommandArgument(chatPrompt)} --format markdown`);
 }
 
 function hasStructuralFailures(result) {
@@ -159,7 +155,7 @@ export function createBenchmarkTemplateNextAction(payload) {
   return {
     label: "Run the Codex benchmark",
     why: "Benchmarking now means a real codex exec run, so the next step is to execute the edited scenarios in an isolated workspace.",
-    command: `plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath} --format markdown`,
+    command: formatGeneratedCommand(`plugin-eval benchmark ${commandTargetPath} --config ${commandConfigPath} --workspace-source YOUR_TEST_WORKSPACE --format markdown`),
     chatPrompt: `Help me benchmark this ${targetLabel(payload.target)}.`,
   };
 }
@@ -171,9 +167,9 @@ export function createBenchmarkRunNextAction(payload) {
     why: payload.usageLogPath
       ? "The Codex run produced observed usage, so the next step is to re-run analysis with those measurements."
       : "This benchmark completed without usage telemetry, so the report and preserved artifacts are the primary signal.",
-    command: payload.usageLogPath
+    command: formatGeneratedCommand(payload.usageLogPath
       ? `plugin-eval analyze ${commandTargetPath} --observed-usage ${formatCommandPath(payload.usageLogPath)} --format markdown`
-      : `plugin-eval report ${formatCommandPath(payload.resultPath)} --format markdown`,
+      : `plugin-eval report ${formatCommandPath(payload.resultPath)} --format markdown`),
     chatPrompt: payload.usageLogPath ? `What should I run next?` : `Help me benchmark this ${targetLabel(payload.target)}.`,
   };
 }

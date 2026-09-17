@@ -5,13 +5,15 @@ import path from "node:path";
 import { analyzeCoverageArtifacts } from "../evaluators/coverage.js";
 import { analyzePythonFiles } from "../evaluators/python.js";
 import { analyzeTypeScriptFiles } from "../evaluators/typescript.js";
-import { formatCommandPath, pathExists, readJson, readText, relativePath, writeJson, writeText } from "../lib/files.js";
+import { ensureImplicitOutputDirectory, formatCommandPath, formatGeneratedCommand, pathExists, readJson, readText, relativePath, writeImplicitOutputJson, writeImplicitOutputText, writeJson, writeText } from "../lib/files.js";
 import { createBenchmarkRunNextAction, createBenchmarkTemplateNextAction } from "./presentation.js";
 import { createArtifact } from "./schema.js";
 import { summarizeCodexEvents, parseCodexJsonStream } from "./benchmark-events.js";
 import {
   defaultTargetProvisioningMode,
+  BenchmarkResourceLimitError,
   diffWorkspaceSnapshots,
+  normalizeBenchmarkFilePath,
   provisionBenchmarkWorkspace,
   snapshotWorkspace,
   summarizeWorkspaceDiff,
@@ -20,6 +22,22 @@ import { resolveTarget } from "./target.js";
 import { buildWorkflowGuide } from "./workflow-guide.js";
 
 const BENCHMARK_SCHEMA_VERSION = 2;
+const CHILD_ENV_KEYS = ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "TZ", "NODE_EXTRA_CA_CERTS"];
+const MAX_CHILD_STDOUT_BYTES = 16 * 1024 * 1024;
+const MAX_CHILD_STDERR_BYTES = 4 * 1024 * 1024;
+
+function benchmarkChildEnv(homePath, codexHomePath) {
+  const env = {};
+  for (const key of CHILD_ENV_KEYS) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  if (homePath) {
+    env.HOME = homePath;
+    env.USERPROFILE = homePath;
+    env.CODEX_HOME = codexHomePath;
+  }
+  return env;
+}
 
 function sanitizeId(value) {
   return String(value || "scenario")
@@ -75,16 +93,23 @@ function normalizeConfig(config, target) {
 
   if (config.schemaVersion !== BENCHMARK_SCHEMA_VERSION) {
     throw new Error(
-      `Unsupported benchmark schema version: ${config.schemaVersion}. Re-run \`plugin-eval init-benchmark ${formatCommandPath(target.path)}\` to regenerate the config.`,
+      `Unsupported benchmark schema version: ${config.schemaVersion}. Re-run \`${formatGeneratedCommand(`plugin-eval init-benchmark ${formatCommandPath(target.path)}`)}\` to regenerate the config.`,
     );
   }
 
   if (config.runner?.type !== "codex-cli") {
     throw new Error("Benchmark runner.type must be \"codex-cli\".");
   }
+  if (config.runner.sandbox !== "workspace-write" || config.runner.approvalPolicy !== "never" ||
+    (config.runner.extraArgs && (!Array.isArray(config.runner.extraArgs) || config.runner.extraArgs.length > 0))) {
+    throw new Error("Benchmark runner must use workspace-write, approvalPolicy never, and no extraArgs.");
+  }
 
   if (!config.workspace?.sourcePath) {
     throw new Error("Benchmark config must set workspace.sourcePath.");
+  }
+  if ((config.workspace.setupMode || "copy") !== "copy") {
+    throw new Error("Benchmark workspace setupMode must be copy; git-worktree is disabled.");
   }
 
   if (!config.targetProvisioning?.mode) {
@@ -203,10 +228,10 @@ async function createStarterBenchmarkConfig(target, options = {}) {
       mode: defaultTargetProvisioningMode(target),
     },
     verifiers: {
-      commands: [],
+      files: [],
     },
     notes: [
-      "Edit workspace.sourcePath so it points at the repo or template you want Codex to work inside.",
+      "Edit workspace.sourcePath so it points at the source for explicitly included test files; the workspace starts empty.",
       "Edit the scenarios so they match real tasks instead of generic starter prompts.",
       "Benchmark means real codex exec runs now. There is no simulated dry-run mode.",
     ],
@@ -225,32 +250,21 @@ async function loadBenchmarkConfig(target, options = {}) {
     };
   }
 
-  const defaultConfigPath = defaultBenchmarkConfigPath(target);
-  if (await pathExists(defaultConfigPath)) {
-    const config = await readJson(defaultConfigPath);
-    return {
-      config: normalizeConfig(config, target),
-      configPath: defaultConfigPath,
-      source: "file",
-    };
-  }
-
-  const generated = await createStarterBenchmarkConfig(target, options);
-  return {
-    config: generated,
-    configPath: null,
-    source: "generated",
-  };
+  throw new Error("A live benchmark requires an explicit --config path. Review the benchmark file before running it.");
 }
 
-async function runProcessCapture({
+export async function runProcessCapture({
   command,
   args,
   cwd,
   env,
-  stdoutPath,
-  stderrPath,
+  stdoutLimitBytes = MAX_CHILD_STDOUT_BYTES,
+  stderrLimitBytes = MAX_CHILD_STDERR_BYTES,
 }) {
+  if (!Number.isSafeInteger(stdoutLimitBytes) || stdoutLimitBytes < 1 || stdoutLimitBytes > MAX_CHILD_STDOUT_BYTES ||
+    !Number.isSafeInteger(stderrLimitBytes) || stderrLimitBytes < 1 || stderrLimitBytes > MAX_CHILD_STDERR_BYTES) {
+    throw new Error("Benchmark child output limits must be positive byte counts no greater than the defaults.");
+  }
   const startedAt = Date.now();
   const child = spawn(command, args, {
     cwd,
@@ -260,17 +274,29 @@ async function runProcessCapture({
 
   const stdoutChunks = [];
   const stderrChunks = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let limitError = null;
+
+  const capture = (stream, chunk, chunks, limit) => {
+    if (stream === "stdout") stdoutBytes += chunk.length;
+    else stderrBytes += chunk.length;
+    const observed = stream === "stdout" ? stdoutBytes : stderrBytes;
+    if (limitError) return;
+    if (observed > limit) {
+      limitError = new BenchmarkResourceLimitError(`child ${stream}`, limit, observed);
+      child.kill("SIGKILL");
+      return;
+    }
+    chunks.push(chunk);
+  };
 
   if (child.stdout) {
-    child.stdout.on("data", (chunk) => {
-      stdoutChunks.push(chunk);
-    });
+    child.stdout.on("data", (chunk) => capture("stdout", chunk, stdoutChunks, stdoutLimitBytes));
   }
 
   if (child.stderr) {
-    child.stderr.on("data", (chunk) => {
-      stderrChunks.push(chunk);
-    });
+    child.stderr.on("data", (chunk) => capture("stderr", chunk, stderrChunks, stderrLimitBytes));
   }
 
   const outcome = await new Promise((resolve, reject) => {
@@ -280,15 +306,10 @@ async function runProcessCapture({
     });
   });
 
+  if (limitError) throw limitError;
+
   const stdoutText = Buffer.concat(stdoutChunks).toString("utf8");
   const stderrText = Buffer.concat(stderrChunks).toString("utf8");
-
-  if (stdoutPath) {
-    await writeText(stdoutPath, stdoutText);
-  }
-  if (stderrPath) {
-    await writeText(stderrPath, stderrText);
-  }
 
   return {
     ...outcome,
@@ -301,7 +322,7 @@ async function runProcessCapture({
 function buildObservedUsageLine(target, scenario, usage) {
   return JSON.stringify({
     id: `${target.name}-${scenario.id}`,
-    usage: usage.raw || usage,
+    usage,
     metadata: {
       scenario: scenario.title,
       scenario_id: scenario.id,
@@ -342,6 +363,25 @@ function buildCodexExecArgs({
   ];
 }
 
+function parseCodexExecutableArgs(value) {
+  if (!value) {
+    return [];
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("PLUGIN_EVAL_CODEX_EXECUTABLE_ARGS must be a JSON array of strings.");
+  }
+
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error("PLUGIN_EVAL_CODEX_EXECUTABLE_ARGS must be a JSON array of strings.");
+  }
+
+  return parsed;
+}
+
 function filterCodeFiles(filePaths) {
   const tsFiles = [];
   const pyFiles = [];
@@ -374,35 +414,39 @@ async function analyzeChangedWorkspaceCode(workspacePath, changedRelativePaths) 
   };
 }
 
-async function runVerifierCommands({ commands, cwd, processRunner, basePath }) {
-  const results = [];
+function runVerifierFiles(files, beforeSnapshot, afterSnapshot) {
+  return files.map((filePath) => ({
+    path: filePath,
+    status: afterSnapshot.has(filePath) && !beforeSnapshot.has(filePath) ? "passed" : "failed",
+    check: "created-file",
+  }));
+}
 
-  for (let index = 0; index < commands.length; index += 1) {
-    const command = commands[index];
-    const stdoutPath = path.join(basePath, `verifier-${index + 1}.stdout.log`);
-    const stderrPath = path.join(basePath, `verifier-${index + 1}.stderr.log`);
-    const outcome = await processRunner({
-      kind: "verifier",
-      command: "/bin/zsh",
-      args: ["-lc", command],
-      cwd,
-      env: process.env,
-      stdoutPath,
-      stderrPath,
-    });
+function safeUsage(usage) {
+  if (!usage) return null;
+  return {
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    total_tokens: usage.total_tokens,
+  };
+}
 
-    results.push({
-      command,
-      status: outcome.code === 0 ? "passed" : "failed",
-      exitCode: outcome.code,
-      signal: outcome.signal || null,
-      durationMs: outcome.durationMs,
-      stdoutPath,
-      stderrPath,
-    });
-  }
+function safeTelemetry(telemetry, usage) {
+  return {
+    eventCount: telemetry.eventCount,
+    ignoredLineCount: telemetry.ignoredLineCount,
+    finalStatus: telemetry.finalStatus,
+    toolCallCount: telemetry.toolCallCount,
+    shellCommandCount: telemetry.shellCommandCount,
+    failedShellCommandCount: telemetry.failedShellCommandCount,
+    usage,
+    usageAvailability: telemetry.usageAvailability,
+  };
+}
 
-  return results;
+function safeCodexVersion(value) {
+  const line = String(value || "").trim().split(/\r?\n/).pop() || "";
+  return /^codex(?:-cli)? [0-9]{1,4}(?:\.[0-9]{1,4}){1,3}(?:[-+][a-zA-Z0-9.-]{1,32})?$/.test(line) ? line : "unknown";
 }
 
 function summarizeRunScenarios(runScenarios) {
@@ -454,7 +498,8 @@ export async function initializeBenchmark(targetPath, options = {}) {
   const target = await resolveTarget(targetPath);
   const config = await createStarterBenchmarkConfig(target, options);
   const outputPath = path.resolve(options.outputPath || defaultBenchmarkConfigPath(target));
-  await writeJson(outputPath, config);
+  if (options.outputPath) await writeJson(outputPath, config);
+  else await writeImplicitOutputJson(outputPath, config);
 
   const payload = {
     kind: "benchmark-template-init",
@@ -468,8 +513,8 @@ export async function initializeBenchmark(targetPath, options = {}) {
     notes: config.notes,
     setupQuestions: config.setupQuestions || [],
     nextSteps: [
-      `Edit ${formatCommandPath(outputPath)} so workspace.sourcePath, scenarios, and verifiers match your real workflow.`,
-      `Run the benchmark with: plugin-eval benchmark ${formatCommandPath(target.path)} --config ${formatCommandPath(outputPath)}`,
+      `Edit ${formatCommandPath(outputPath)} so workspace.sourcePath, scenarios, and file checks match your real workflow.`,
+      `Run the benchmark with: ${formatGeneratedCommand(`plugin-eval benchmark ${formatCommandPath(target.path)} --config ${formatCommandPath(outputPath)} --workspace-source YOUR_TEST_WORKSPACE`)}`,
       "The benchmark result will be written under .plugin-eval/runs/<timestamp>/benchmark-run.json.",
     ],
     workflowGuide: await buildWorkflowGuide(target.path, {
@@ -490,6 +535,9 @@ export async function initializeBenchmark(targetPath, options = {}) {
 export async function runBenchmark(targetPath, options = {}) {
   const target = await resolveTarget(targetPath);
   const { config, configPath, source } = await loadBenchmarkConfig(target, options);
+  if (!options.workspaceSourcePath || path.resolve(options.workspaceSourcePath) !== path.resolve(config.workspace.sourcePath)) {
+    throw new Error("Benchmark requires --workspace-source matching the reviewed config workspace.sourcePath.");
+  }
   const scenarios = (config.scenarios || []).map(normalizeScenario).filter((scenario) => scenario.userInput);
   if (scenarios.length === 0) {
     throw new Error("Benchmark config does not contain any runnable scenarios.");
@@ -497,26 +545,34 @@ export async function runBenchmark(targetPath, options = {}) {
   if (options.dryRun) {
     throw new Error("CLI-only benchmarking no longer supports --dry-run. Edit the benchmark config, then run `plugin-eval benchmark` for a real Codex execution.");
   }
+  if (config.verifiers?.commands?.length || options.allowVerifiers) {
+    throw new Error("Executable verifiers are disabled. Use verifiers.files for created-file checks.");
+  }
+  const verifierFiles = config.verifiers?.files || [];
+  if (!Array.isArray(verifierFiles)) throw new Error("verifiers.files must be an array of relative file paths.");
+  const checkedVerifierFiles = verifierFiles.map(normalizeBenchmarkFilePath);
 
   const processRunner = options.processRunner || runProcessCapture;
   const codexExecutable = options.codexExecutable || process.env.PLUGIN_EVAL_CODEX_EXECUTABLE || "codex";
+  const codexExecutableArgs = Array.isArray(options.codexExecutableArgs)
+    ? options.codexExecutableArgs
+    : parseCodexExecutableArgs(process.env.PLUGIN_EVAL_CODEX_EXECUTABLE_ARGS);
   const runId = createRunId();
   const runDirectory = path.join(benchmarkRunsDirectoryForTarget(target), runId);
-  await fs.mkdir(runDirectory, { recursive: true });
+  await ensureImplicitOutputDirectory(runDirectory);
 
   let codexVersion = "unknown";
   try {
     const versionResult = await processRunner({
       kind: "codex-version",
       command: codexExecutable,
-      args: ["--version"],
+      args: [...codexExecutableArgs, "--version"],
       cwd: process.cwd(),
-      env: process.env,
-      stdoutPath: path.join(runDirectory, "codex-version.stdout.log"),
-      stderrPath: path.join(runDirectory, "codex-version.stderr.log"),
+      env: benchmarkChildEnv(),
     });
-    codexVersion = (versionResult.stdoutText || versionResult.stderrText || "unknown").trim().split(/\r?\n/).pop() || "unknown";
-  } catch {
+    codexVersion = safeCodexVersion(versionResult.stdoutText || versionResult.stderrText);
+  } catch (error) {
+    if (error instanceof BenchmarkResourceLimitError) throw error;
     codexVersion = "unknown";
   }
 
@@ -526,19 +582,21 @@ export async function runBenchmark(targetPath, options = {}) {
   for (let index = 0; index < scenarios.length; index += 1) {
     const scenario = scenarios[index];
     const scenarioDirectory = path.join(runDirectory, `${String(index + 1).padStart(2, "0")}-${scenario.id}`);
-    await fs.mkdir(scenarioDirectory, { recursive: true });
+    await ensureImplicitOutputDirectory(scenarioDirectory);
 
     const provisioned = await provisionBenchmarkWorkspace({
       target,
       config,
       scenarioId: scenario.id,
+      workspaceIncludes: options.workspaceIncludes || [],
+      targetIncludes: options.targetIncludes || [],
     });
+    let shouldPreserveWorkspace = false;
+    try {
     const beforeSnapshot = await snapshotWorkspace(provisioned.workspacePath);
-    const stdoutPath = path.join(scenarioDirectory, "codex.stdout.jsonl");
-    const stderrPath = path.join(scenarioDirectory, "codex.stderr.log");
-    const finalMessagePath = path.join(scenarioDirectory, "final-message.txt");
+    const finalMessagePath = path.join(provisioned.homePath, "final-message.txt");
 
-    const args = buildCodexExecArgs({
+    const codexArgs = buildCodexExecArgs({
       config,
       model: options.model || config.runner.model || defaultModelForTarget(target),
       workspacePath: provisioned.workspacePath,
@@ -549,20 +607,16 @@ export async function runBenchmark(targetPath, options = {}) {
     const codexRun = await processRunner({
       kind: "codex",
       command: codexExecutable,
-      args,
+      args: [...codexExecutableArgs, ...codexArgs],
       cwd: provisioned.workspacePath,
-      env: {
-        ...process.env,
-        HOME: provisioned.homePath,
-        CODEX_HOME: provisioned.codexHomePath,
-      },
-      stdoutPath,
-      stderrPath,
+      env: benchmarkChildEnv(provisioned.homePath, provisioned.codexHomePath),
     });
 
     const parsedEvents = parseCodexJsonStream(codexRun.stdoutText);
     const telemetry = summarizeCodexEvents(parsedEvents.events);
     telemetry.ignoredLineCount = parsedEvents.ignoredLines.length;
+    const usage = safeUsage(telemetry.usage);
+    const publicTelemetry = safeTelemetry(telemetry, usage);
 
     const afterSnapshot = await snapshotWorkspace(provisioned.workspacePath);
     const workspaceDiff = diffWorkspaceSnapshots(beforeSnapshot, afterSnapshot);
@@ -571,26 +625,33 @@ export async function runBenchmark(targetPath, options = {}) {
       provisioned.workspacePath,
       workspaceSummary.changedFiles.map((entry) => entry.path),
     );
-    const verifierResults = await runVerifierCommands({
-      commands: Array.isArray(config.verifiers?.commands) ? config.verifiers.commands : [],
-      cwd: provisioned.workspacePath,
-      processRunner,
-      basePath: scenarioDirectory,
-    });
+    const verifierResults = runVerifierFiles(checkedVerifierFiles, beforeSnapshot, afterSnapshot);
 
-    const finalMessage = await readText(finalMessagePath).catch(() => "");
+    const finalMessageBytes = await fs.stat(finalMessagePath).then((stat) => stat.size).catch(() => 0);
     const codexSucceeded = codexRun.code === 0 && telemetry.finalStatus !== "failed";
     const verifiersPassed = verifierResults.every((result) => result.status === "passed");
     const scenarioStatus = codexSucceeded && verifiersPassed ? "completed" : "failed";
 
-    if (telemetry.usage) {
-      usageLines.push(buildObservedUsageLine(target, scenario, telemetry.usage));
+    if (usage) {
+      usageLines.push(buildObservedUsageLine(target, scenario, usage));
     }
 
+    const diagnosticsPath = path.join(scenarioDirectory, "diagnostics.json");
+    await writeImplicitOutputJson(diagnosticsPath, {
+      rawOutputRetained: false,
+      stdoutBytes: Buffer.byteLength(codexRun.stdoutText || "", "utf8"),
+      stderrBytes: Buffer.byteLength(codexRun.stderrText || "", "utf8"),
+      finalMessageBytes,
+      exitCode: codexRun.code,
+      durationMs: codexRun.durationMs,
+      telemetry: publicTelemetry,
+    });
+
     const preserveMode = config.workspace.preserve || "on-failure";
-    const shouldPreserveWorkspace =
+    shouldPreserveWorkspace = !provisioned.sensitiveHomeSeeded && (
       preserveMode === "always" ||
-      (preserveMode === "on-failure" && scenarioStatus !== "completed");
+      (preserveMode === "on-failure" && scenarioStatus !== "completed")
+    );
 
     runScenarios.push({
       id: scenario.id,
@@ -602,24 +663,56 @@ export async function runBenchmark(targetPath, options = {}) {
       signal: codexRun.signal || null,
       durationMs: codexRun.durationMs,
       prompt: scenario.userInput,
-      finalMessagePath: await pathExists(finalMessagePath) ? finalMessagePath : null,
-      finalMessagePreview: finalMessage.trim() || null,
-      rawEventLogPath: stdoutPath,
-      stderrLogPath: stderrPath,
-      usage: telemetry.usage,
-      usageAvailability: telemetry.usageAvailability,
-      telemetry,
+      finalMessagePath: null,
+      finalMessagePreview: null,
+      rawEventLogPath: null,
+      stderrLogPath: null,
+      diagnosticsPath,
+      usage,
+      usageAvailability: publicTelemetry.usageAvailability,
+      telemetry: publicTelemetry,
       workspacePath: shouldPreserveWorkspace ? provisioned.workspacePath : null,
-      workspaceSummary,
-      workspaceChanges: workspaceSummary.allChanges,
-      generatedCode,
+      workspaceSummary: {
+        addedFileCount: workspaceSummary.addedFileCount,
+        modifiedFileCount: workspaceSummary.modifiedFileCount,
+        deletedFileCount: workspaceSummary.deletedFileCount,
+        changedFileCount: workspaceSummary.changedFileCount,
+        generatedFileCount: workspaceSummary.generatedFileCount,
+        generatedTestFileCount: workspaceSummary.generatedTestFileCount,
+        changedTestFileCount: workspaceSummary.changedTestFileCount,
+        changedTextLineDelta: workspaceSummary.changedTextLineDelta,
+      },
+      workspaceChanges: [],
+      generatedCode: {
+        metrics: generatedCode.metrics
+          .filter((metric) => typeof metric.value === "number" && Number.isFinite(metric.value))
+          .map(({ id, value, unit, band }) => ({ id, value, unit, band })),
+        checks: [],
+        artifacts: [],
+      },
       verifierResults,
       installedTargetPath: provisioned.installedTargetPath,
       codexHomePath: provisioned.codexHomePath,
     });
 
-    if (!shouldPreserveWorkspace) {
-      await provisioned.cleanup();
+    } catch (error) {
+      if (error instanceof BenchmarkResourceLimitError) {
+        await writeImplicitOutputJson(path.join(scenarioDirectory, "diagnostics.json"), {
+          rawOutputRetained: false,
+          status: "resource-limit-exceeded",
+          resource: error.resource,
+          limit: error.limit,
+          observed: error.observed,
+          unit: error.unit,
+        });
+      }
+      throw error;
+    } finally {
+      try {
+        await provisioned.cleanupSensitiveHome();
+      } finally {
+        if (!shouldPreserveWorkspace) await provisioned.cleanup();
+      }
     }
   }
 
@@ -627,8 +720,10 @@ export async function runBenchmark(targetPath, options = {}) {
     ? path.resolve(options.usageOutPath || defaultUsageLogPath(target))
     : null;
   if (usageOutPath) {
-    await writeText(usageOutPath, `${usageLines.join("\n")}\n`);
-    await writeText(path.join(runDirectory, "observed-usage.jsonl"), `${usageLines.join("\n")}\n`);
+    const usageText = `${usageLines.join("\n")}\n`;
+    if (options.usageOutPath) await writeText(usageOutPath, usageText);
+    else await writeImplicitOutputText(usageOutPath, usageText);
+    await writeImplicitOutputText(path.join(runDirectory, "observed-usage.jsonl"), usageText);
   }
 
   const resultOutPath = path.resolve(options.resultOutPath || path.join(runDirectory, "benchmark-run.json"));
@@ -654,7 +749,7 @@ export async function runBenchmark(targetPath, options = {}) {
       workspaceSetupMode: config.workspace.setupMode || "copy",
       workspacePreserve: config.workspace.preserve || "on-failure",
       targetProvisioningMode: config.targetProvisioning.mode,
-      verifierCount: Array.isArray(config.verifiers?.commands) ? config.verifiers.commands.length : 0,
+      verifierCount: checkedVerifierFiles.length,
     },
     runDirectory,
     usageLogPath: usageOutPath,
@@ -663,11 +758,11 @@ export async function runBenchmark(targetPath, options = {}) {
     scenarios: runScenarios,
     nextSteps: usageOutPath
       ? [
-          `Analyze the observed usage with: plugin-eval analyze ${formatCommandPath(target.path)} --observed-usage ${formatCommandPath(usageOutPath)} --format markdown`,
-          `Review the measurement plan with: plugin-eval measurement-plan ${formatCommandPath(target.path)} --observed-usage ${formatCommandPath(usageOutPath)} --format markdown`,
+          `Analyze the observed usage with: ${formatGeneratedCommand(`plugin-eval analyze ${formatCommandPath(target.path)} --observed-usage ${formatCommandPath(usageOutPath)} --format markdown`)}`,
+          `Review the measurement plan with: ${formatGeneratedCommand(`plugin-eval measurement-plan ${formatCommandPath(target.path)} --observed-usage ${formatCommandPath(usageOutPath)} --format markdown`)}`,
         ]
       : [
-          `Review the benchmark report with: plugin-eval report ${formatCommandPath(resultOutPath)} --format markdown`,
+          `Review the benchmark report with: ${formatGeneratedCommand(`plugin-eval report ${formatCommandPath(resultOutPath)} --format markdown`)}`,
           "If token usage was unavailable, use the workspace outputs and verifier results as the primary quality signal.",
         ],
     workflowGuide: await buildWorkflowGuide(target.path, {
@@ -676,6 +771,7 @@ export async function runBenchmark(targetPath, options = {}) {
   };
 
   payload.nextAction = createBenchmarkRunNextAction(payload);
-  await writeJson(resultOutPath, payload);
+  if (options.resultOutPath) await writeJson(resultOutPath, payload);
+  else await writeImplicitOutputJson(resultOutPath, payload);
   return payload;
 }

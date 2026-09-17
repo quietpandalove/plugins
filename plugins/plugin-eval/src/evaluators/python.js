@@ -113,7 +113,7 @@ export async function analyzePythonFiles(filePaths, rootPath) {
     maxNesting = Math.max(maxNesting, fileMaxNesting);
     functionCount += functions.length;
     totalFunctionLength += functions.reduce((sum, fn) => sum + fn.length, 0);
-    if (/(^|\/)(tests?|__tests__)\/|(^|\/)test_[^/]+\.py$/.test(filePath)) {
+    if (/(^|\/)(tests?|__tests__)\/|(^|\/)test_[^/]+\.py$/.test(relativePath(rootPath, filePath))) {
       testFileCount += 1;
     }
 

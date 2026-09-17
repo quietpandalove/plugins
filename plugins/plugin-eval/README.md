@@ -92,7 +92,7 @@ plugin-eval analyze <path> --format markdown
 plugin-eval explain-budget <path> --format markdown
 plugin-eval measurement-plan <path> --format markdown
 plugin-eval init-benchmark <path>
-plugin-eval benchmark <path> --format markdown
+plugin-eval benchmark <path> --config <reviewed-benchmark.json> --workspace-source <sanitized-directory> --format markdown
 plugin-eval report <result.json> --format markdown
 plugin-eval compare <before.json> <after.json> --format markdown
 ```
@@ -121,6 +121,11 @@ Compatibility aliases still work:
 - `analyze`, `explain-budget`, and `measurement-plan` inspect local files and write local reports only.
 - `init-benchmark` creates starter benchmark configuration under `.plugin-eval/` for the target you choose.
 - `benchmark` runs a live local Codex CLI workflow in an isolated temp workspace and writes artifacts under `.plugin-eval/`.
+- `benchmark` requires an explicit `--config` path and a separately named `--workspace-source` matching the reviewed config. It does not copy your default `~/.codex/auth.json` or `config.toml` into temp homes. Set `PLUGIN_EVAL_CODEX_HOME_SOURCE` to a scoped test Codex home when credentials or config are needed. That temporary home is removed even if the workspace is retained after a failed run.
+- Benchmark workspaces start empty. Use repeated `--workspace-include <relative-file>` for exact reviewed files from `--workspace-source`; directories and symbolic links are not accepted. Skill installs include only `SKILL.md` automatically. Plugin benchmarks require repeated `--target-include <relative-file>` for the reviewed files needed beyond `.codex-plugin/plugin.json`. Explicitly included files can still contain secrets, so use sanitized fixtures. Git-worktree mode is disabled.
+- `verifiers.files` checks that named relative files were created during the scenario; paths are exact-case on every platform. Executable verifiers and `--allow-verifiers` are disabled. Raw child stdout, stderr, final messages, and tool-command text are not retained; per-scenario `diagnostics.json` keeps status, counts, and token totals. Workspaces are not preserved when an explicit Codex home was seeded.
+- Implicit `.plugin-eval/` output paths refuse links and junctions; explicit output paths remain operator-controlled. Child output is limited to 16 MiB stdout and 4 MiB stderr. Workspace snapshots and coverage-file reads each reject files over 64 MiB or totals over 256 MiB, including coverage artifacts in snapshot-ignored directories. Exceeding a limit fails the benchmark without storing raw output.
+- On Windows, generated local commands explicitly invoke PowerShell with encoded arguments. They are safe to paste into Command Prompt or PowerShell; the encoding prevents either shell from interpreting crafted path or prompt text as commands. POSIX systems keep readable shell commands.
 - Review the generated benchmark configuration before running it, especially when the target project or prompts did not come from you.
 - Keep generated `.plugin-eval/` artifacts and local `node_modules/` directories out of commits unless you explicitly want to version them.
 
